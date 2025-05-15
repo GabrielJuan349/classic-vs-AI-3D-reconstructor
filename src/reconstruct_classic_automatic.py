@@ -123,13 +123,16 @@ def run_colmap_pipeline(
         env["QT_QPA_PLATFORM"] = "offscreen"
         env["LIBGL_ALWAYS_SOFTWARE"] = "1"
         env["CUDA_VISIBLE_DEVICES"] = ""        # CPU box
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=False,              # ← capture bytes, not str
         )
+        for line in proc.stdout:
+            sys.stdout.buffer.write(line)            # live print
+        proc.wait()
         if proc.returncode:
             # decode loosely so we can still print the log
             print(proc.stdout.decode("utf-8", errors="replace"))
@@ -143,16 +146,57 @@ def run_colmap_pipeline(
             colmap, "automatic_reconstructor",
             f"--workspace_path={work_dir}",
             f"--image_path={images_dir}",
+
+            # --- general settings ---
+            #"--quality",           "low",     # fewer levels = faster on CPU
+            "--use_gpu",            "0",
+            "--gpu_index",         "-1",      # stays on CPU even if CUDA libs appear
+            "--camera_model",      "PINHOLE", # replaces old ImageReader.camera_model
+            "--single_camera",     "1",       # same intrinsics for all images
+
+            # --- dense settings ---
+            "--dense",             "1",       # run Patch-Match
         ],
         "automatic_reconstructor",
     )
 
-    fused_ply = dense_dir / "fused.ply"
-    if not fused_ply.exists():
-        raise RuntimeError("stereo_fusion completed but fused.ply not found.")
+    fused_ply = work_dir / "dense" / "fused.ply"
+    alt_clean = work_dir / "dense" / "0" / "clean.ply"
+    dense0 = work_dir / "dense" / "0" 
+    depth_dir = dense0 / "stereo" / "depth_maps"
 
-    print(f"✓ Dense cloud saved at {fused_ply}")
-    return fused_ply
+    if not depth_dir.exists() or not any(depth_dir.iterdir()):
+        print("ℹ️  No depth maps found after automatic – running PatchMatch + Fusion …")
+        # ➊  Patch-Match stereo  (writes depth_maps + normal_maps + conf)
+        subprocess.run([
+            colmap, "patch_match_stereo",
+            "--workspace_path",   str(dense0),
+            "--workspace_format", "COLMAP",
+            "--PatchMatchStereo.geom_consistency", "1",
+            "--PatchMatchStereo.max_image_size", str(max_image_size),
+            "--gpu_index", "-1"                       # CPU-only
+        ], check=True)
+
+        # ➋  Stereo Fusion  → dense/fused.ply
+        fused_ply = work_dir / "dense" / "fused.ply"
+        subprocess.run([
+            colmap, "stereo_fusion",
+            "--workspace_path",   str(dense0),
+            "--workspace_format", "COLMAP",
+            "--output_path",      str(fused_ply),
+            "--StereoFusion.min_num_pixels", "5"
+        ], check=True)
+    
+    # pick whichever file now exists
+    if fused_ply.exists():
+        final_cloud = fused_ply
+    elif alt_clean.exists():
+        final_cloud = alt_clean
+    else:
+        raise RuntimeError("No dense cloud produced by automatic_reconstructor.")
+
+    print(f"✓ Dense cloud saved at {final_cloud}")
+    return final_cloud
 # ---------------------------------------------------------------------- #
 # Fase 1 – ICP + Poisson Mesh
 # ---------------------------------------------------------------------- #
@@ -193,12 +237,20 @@ def main() -> None:
     parser.add_argument("--out", default="model.obj", help="Fitxer de sortida 3D")
     parser.add_argument("--only_sfm", action="store_true", help="Run COLMAP only up to sparse model")
     parser.add_argument("--max_image_size", type=int, default=2000)
+    parser.add_argument("--reset_workspace", type=bool, default=False)
 
     args = parser.parse_args()
+
 
     orig_dir = Path(args.images_dir).resolve()
     work_dir = Path(args.work_dir).resolve()
     ensure_dir(work_dir)
+
+    if args.reset_workspace:
+        if (work_dir / "dense" / "0").exists():
+            shutil.rmtree(work_dir / "dense/0")
+            shutil.rmtree(work_dir / "sparse/0")
+            os.remove(work_dir/"database.db")
 
     # 0. Filtrar i copiar només les imatges que compleixen el prefix
     selected = list_images_with_prefix(orig_dir, args.prefix)

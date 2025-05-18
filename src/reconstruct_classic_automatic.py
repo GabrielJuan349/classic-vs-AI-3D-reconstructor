@@ -30,6 +30,8 @@ import shutil
 import subprocess
 import open3d as o3d
 import os
+import numpy as np
+
 
 
 # ---------------------------------------------------------------------- #
@@ -121,8 +123,8 @@ def run_colmap_pipeline(
         print(f"▶ {tag}")
         env = os.environ.copy()
         env["QT_QPA_PLATFORM"] = "offscreen"
-        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-        env["CUDA_VISIBLE_DEVICES"] = ""        # CPU box
+        #env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        #env["CUDA_VISIBLE_DEVICES"] = ""        # CPU box
         proc = subprocess.Popen(
             cmd,
             env=env,
@@ -149,8 +151,8 @@ def run_colmap_pipeline(
 
             # --- general settings ---
             #"--quality",           "low",     # fewer levels = faster on CPU
-            "--use_gpu",            "0",
-            "--gpu_index",         "-1",      # stays on CPU even if CUDA libs appear
+            #"--use_gpu",            "0",
+            "--gpu_index",         "0",      # stays on CPU even if CUDA libs appear
             "--camera_model",      "PINHOLE", # replaces old ImageReader.camera_model
             "--single_camera",     "1",       # same intrinsics for all images
 
@@ -160,7 +162,7 @@ def run_colmap_pipeline(
         "automatic_reconstructor",
     )
 
-    fused_ply = work_dir / "dense" / "fused.ply"
+    fused_ply = work_dir / "dense" / "0" / "fused.ply"
     alt_clean = work_dir / "dense" / "0" / "clean.ply"
     dense0 = work_dir / "dense" / "0" 
     depth_dir = dense0 / "stereo" / "depth_maps"
@@ -200,6 +202,110 @@ def run_colmap_pipeline(
 # ---------------------------------------------------------------------- #
 # Fase 1 – ICP + Poisson Mesh
 # ---------------------------------------------------------------------- #
+def refine_icp(pcd: o3d.geometry.PointCloud,
+               voxel: float = 0.005,
+               max_iter: int = 200,
+               dist_factor: float = 2.0) -> o3d.geometry.PointCloud:
+    """
+    Down-samples, filters and rigidly self-aligns a dense point cloud.
+
+    * The cloud is voxel-down-sampled twice (coarse+fine).
+    * Point-to-plane ICP aligns the coarse cloud to the fine cloud,
+      producing a small smoothing / de-noising transform.
+    * The transform is applied to the ORIGINAL-RESOLUTION point cloud.
+    * Statistical outliers are removed and normals re-estimated.
+
+    Parameters
+    ----------
+    pcd : open3d.geometry.PointCloud
+        Dense cloud from StereoFusion or AI fusion.
+    voxel : float
+        Base voxel size in world units (e.g. 0.005 m = 5 mm).
+    """
+    if pcd.is_empty():
+        raise RuntimeError("refine_icp(): input point cloud is empty")
+
+    # make sure normals exist
+    if not pcd.has_normals():
+        pcd.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=3 * voxel, max_nn=30))
+
+    # build two down-sampled versions
+    tgt = pcd.voxel_down_sample(voxel_size=voxel)
+    src = pcd.voxel_down_sample(voxel_size=voxel * 2)
+
+    for cloud in (src, tgt):
+        cloud.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=3 * voxel, max_nn=30))
+
+    reg = o3d.pipelines.registration.registration_icp(
+        source=src,
+        target=tgt,
+        max_correspondence_distance=dist_factor * voxel,
+        init=np.eye(4),
+        estimation_method=o3d.pipelines.registration.
+        TransformationEstimationPointToPlane(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+            max_iteration=max_iter))
+
+    # apply the small smoothing transform to the full cloud
+    pcd.transform(reg.transformation)
+
+    # outlier removal
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=3 * voxel, max_nn=30))
+
+    print(f"[ICP] fitness={reg.fitness:.3f}  rmse={reg.inlier_rmse:.4f}")
+    return pcd
+
+
+# ────────────────────────────────────────────────────────────────────────
+#  POISSON MESHING WITH OPEN3D
+# ────────────────────────────────────────────────────────────────────────
+def pointcloud_to_mesh(pcd: o3d.geometry.PointCloud,
+                       depth: int = 10,
+                       density_thresh: float = 0.3,
+                       out_path: Path | str = "mesh_poisson.obj") -> o3d.geometry.TriangleMesh:
+    """
+    Converts a (refined) point cloud to a watertight mesh and saves it.
+
+    Parameters
+    ----------
+    pcd : open3d.geometry.PointCloud
+        Cloud with oriented normals.
+    depth : int
+        Octree depth (8‒12 typical).  Higher = finer.
+    density_thresh : float
+        Remove vertices whose density < mean*density_thresh.
+    out_path : Path | str
+        Output file (.obj, .ply, .glb …).
+
+    Returns
+    -------
+    mesh : open3d.geometry.TriangleMesh
+    """
+    if not pcd.has_normals():
+        raise RuntimeError("pointcloud_to_mesh(): cloud has no normals")
+
+    print("[Mesh] Poisson reconstruction …")
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth)
+    densities = np.asarray(densities)
+
+    # Trim low-support faces
+    keep = densities > density_thresh * densities.mean()
+    mesh = mesh.select_by_index(np.where(keep)[0])
+
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+
+    out_path = Path(out_path)
+    o3d.io.write_triangle_mesh(str(out_path), mesh, write_ascii=False)
+    print(f"[Mesh] Saved mesh → {out_path}")
+    return mesh
+'''
 def refine_icp(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
     """Aplica ICP lleu (auto‑alineació) – placeholder per futurs subnúvols."""
     pcd_down = pcd.voxel_down_sample(0.003)
@@ -224,6 +330,7 @@ def pointcloud_to_mesh(pcd: o3d.geometry.PointCloud, depth: int = 9) -> o3d.geom
     mesh.remove_duplicated_triangles()
     mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=150_000)
     return mesh
+'''
 
 
 # ---------------------------------------------------------------------- #
@@ -278,10 +385,7 @@ def main() -> None:
     pcd = refine_icp(pcd)
 
     print("▶️  Reconstruint malla Poisson…")
-    mesh = pointcloud_to_mesh(pcd)
-    out_path = Path(args.out).resolve()
-    o3d.io.write_triangle_mesh(str(out_path), mesh, write_ascii=False)
-    print(f"🎉 Malla guardada a: {out_path}")
+    mesh = pointcloud_to_mesh(pcd, out_path=args.out)
 
 
 if __name__ == "__main__":

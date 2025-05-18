@@ -1,83 +1,82 @@
+#!/usr/bin/env python
 """
-compare.py – Run classic COLMAP dense and AI-depth dense, then visualise
-both sparse and dense results in colour overlay.
+compare.py
+==========
 
-Usage
------
-python compare.py \
-       --images photos/ --prefix obj_ \
-       --work workspace \
-       --view_sparse --view_dense
+Visual comparison between
+  • the COLMAP-dense cloud        (classic)
+  • the AI-fused depth cloud      (ai)
+
+Two display modes
+-----------------
+overlay   – colour-code the two clouds in the *same* coordinate frame
+side      – translate the AI cloud +X so the two appear side-by-side
+
+The script runs completely head-less: it uses Open3D off-screen
+rendering and saves a PNG snapshot that you can download or open locally.
 """
 
-import argparse, logging, shutil
+# ──────────────────────────────────────────────────────────── imports
+from __future__ import annotations
+import argparse, os, sys
 from pathlib import Path
-import subprocess, sys
-
-from viewer import sparse_to_pcd, ply_to_pcd, show
-from reconstruct_classic import run_colmap_pipeline, pointcloud_to_mesh
-from ai_depth import run_ai_depth
-from fuse_ai import fuse_ai
-
-logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
+import numpy as np
+import open3d as o3d
 
 
-def main(args):
-    work    = Path(args.work).resolve()
-    img_tmp = work / "images"
-    sparse  = work / "sparse"
-    classic = work / "classic"
-    ai_out  = work / "ai"
-
-    # reset
-    if args.reset_workspace and work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True, exist_ok=True)
-
-    # copy selected photos
-    photos = sorted(Path(args.images).glob(f"{args.prefix}*"))
-    img_tmp.mkdir(parents=True, exist_ok=True)
-    for p in photos:
-        shutil.copy2(p, img_tmp/p.name)
-
-    # --- sparse SfM (shared) ---
-    logging.info("Running sparse SfM …")
-    run_colmap_pipeline(img_tmp, work, max_image_size=args.max_size, only_sfm=True)
-
-    if args.view_sparse:
-        show(
-            sparse_to_pcd(sparse, (1,0,0)),      # classic colour red
-        )
-
-    # --- classic dense ---
-    logging.info("Running classic Patch-Match …")
-    fused_cl = run_colmap_pipeline(img_tmp, work, max_image_size=args.max_size)  # gets dense too
-    (classic/"dense").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(fused_cl, classic/"dense/fused.ply")
-
-    # --- AI branch ---
-    logging.info("Running AI depth …")
-    ai_maps = ai_out / "maps"
-    run_ai_depth(img_tmp, ai_maps)
-    fused_ai = ai_out / "fused_ai.ply"
-    fuse_ai(sparse, ai_maps, fused_ai)
-
-    # --- Visualise dense ---
-    if args.view_dense:
-        show(
-            ply_to_pcd(fused_cl, (1,0,0)),    # red
-            ply_to_pcd(fused_ai, (0,1,0))     # green
-        )
+# ───────────────────────────────────────── utility: load cloud
+def load_cloud(path: Path, color: tuple[float, float, float]) -> o3d.geometry.PointCloud:
+    """Read PLY/OBJ/… and paint every point with the given colour (0-1)."""
+    if not path.exists():
+        sys.exit(f"[ERROR] File not found: {path}")
+    pcd = o3d.io.read_point_cloud(str(path))
+    if pcd.is_empty():
+        sys.exit(f"[ERROR] Empty cloud: {path}")
+    pcd.paint_uniform_color(color)
+    return pcd
 
 
+# ───────────────────────────────────────── snapshot generator
+def save_snapshot(geoms: list[o3d.geometry.Geometry],
+                  out_png: Path,
+                  width: int = 1600,
+                  height: int = 900) -> None:
+    """Head-less render of the given geometries → PNG."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(visible=False, width=width, height=height)
+    for g in geoms:
+        vis.add_geometry(g)
+    vis.poll_events(); vis.update_renderer()
+    vis.capture_screen_image(str(out_png), do_render=True)
+    vis.destroy_window()
+    print(f"[Compare] Snapshot saved → {out_png}")
+
+
+# ──────────────────────────────────────────────── main
+def main():
+    ap = argparse.ArgumentParser(description="Visualise classic vs AI clouds.")
+    ap.add_argument("--classic", required=True, help="workspace/dense/fused.ply")
+    ap.add_argument("--ai",      required=True, help="workspace/ai/fused_ai.ply")
+    ap.add_argument("--out",     default="compare.png", help="Output PNG file")
+    ap.add_argument("--mode",    choices=["overlay", "side"], default="side",
+                    help="Visualisation layout")
+    args = ap.parse_args()
+
+    pcd_classic = load_cloud(Path(args.classic), (0.0, 0.6, 1.0))  # blue
+    pcd_ai      = load_cloud(Path(args.ai),      (1.0, 0.3, 0.0))  # orange
+
+    if args.mode == "side":
+        # translate AI cloud along +X so both are visible separately
+        bbox = pcd_classic.get_axis_aligned_bounding_box()
+        dx = bbox.get_extent()[0] * 1.2          # 20 % gap
+        pcd_ai.translate((dx, 0, 0))
+
+    save_snapshot([pcd_classic, pcd_ai], Path(args.out))
+
+
+# ───────────────────────────────────────── entry-point
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--images", required=True)
-    ap.add_argument("--prefix", required=True)
-    ap.add_argument("--work",   default="workspace")
-    ap.add_argument("--max_size", type=int, default=1600)
-    ap.add_argument("--reset_workspace", action="store_true")
-    ap.add_argument("--view_sparse", action="store_true")
-    ap.add_argument("--view_dense",  action="store_true")
-    main(ap.parse_args())
+    main()
 
